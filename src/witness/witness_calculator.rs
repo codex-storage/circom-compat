@@ -1,24 +1,19 @@
-use super::{fnv, CircomBase, SafeMemory, Wasm};
+use super::{fnv, SafeMemory, Wasm};
+use ark_ff::PrimeField;
 use color_eyre::Result;
 use num_bigint::BigInt;
 use num_traits::Zero;
-use std::cell::Cell;
 use wasmer::{imports, Function, Instance, Memory, MemoryType, Module, RuntimeError, Store};
+use wasmer_wasix::WasiEnv;
 
-#[cfg(feature = "circom-2")]
 use num::ToPrimitive;
 
-#[cfg(feature = "circom-2")]
-use super::Circom2;
-
-use super::Circom;
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct WitnessCalculator {
     pub instance: Wasm,
-    pub memory: SafeMemory,
+    pub memory: Option<SafeMemory>,
     pub n64: u32,
-    pub circom_version: u32,
+    pub prime: BigInt,
 }
 
 // Error type to signal end of execution.
@@ -27,7 +22,6 @@ pub struct WitnessCalculator {
 #[error("{0}")]
 struct ExitCode(u32);
 
-#[cfg(feature = "circom-2")]
 fn from_array32(arr: Vec<u32>) -> BigInt {
     let mut res = BigInt::zero();
     let radix = BigInt::from(0x100000000u64);
@@ -37,7 +31,6 @@ fn from_array32(arr: Vec<u32>) -> BigInt {
     res
 }
 
-#[cfg(feature = "circom-2")]
 fn to_array32(s: &BigInt, size: usize) -> Vec<u32> {
     let mut res = vec![0; size];
     let mut rem = s.clone();
@@ -53,26 +46,26 @@ fn to_array32(s: &BigInt, size: usize) -> Vec<u32> {
 }
 
 impl WitnessCalculator {
-    pub fn new(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_file(path)
+    pub fn new(store: &mut Store, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_file(store, path)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let store = Store::default();
+    pub fn from_bytes(store: &mut Store, bytes: &[u8]) -> Result<Self> {
         let module = Module::new(&store, bytes)?;
-        Self::from_module(module)
+        Self::from_module(store, module)
     }
 
-    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let store = Store::default();
+    pub fn from_file(store: &mut Store, path: impl AsRef<std::path::Path>) -> Result<Self> {
         let module = Module::from_file(&store, path)?;
-        Self::from_module(module)
+        Self::from_module(store, module)
     }
 
-    pub fn from_module(module: Module) -> Result<Self> {
-        let store = module.store();
+    pub fn from_module(store: &mut Store, module: Module) -> Result<Self> {
+        let wasm = Self::make_wasm_runtime(store, module)?;
+        Self::new_from_wasm(store, wasm)
+    }
 
-        // Set up the memory
+    pub fn make_wasm_runtime(store: &mut Store, module: Module) -> Result<Wasm> {
         let memory = Memory::new(store, MemoryType::new(2000, None, false)).unwrap();
         let import_object = imports! {
             "env" => {
@@ -92,144 +85,43 @@ impl WitnessCalculator {
                 "writeBufferMessage" => runtime::write_buffer_message(store),
             }
         };
-        let instance = Wasm::new(Instance::new(&module, &import_object)?);
+        let instance = Instance::new(store, &module, &import_object)?;
+        let exports = instance.exports.clone();
+        let mut wasi_env = WasiEnv::builder("calculateWitness").finalize(store)?;
+        wasi_env.initialize_with_memory(store, instance, Some(memory.clone()), false)?;
+        let wasm = Wasm::new(exports, memory);
+        Ok(wasm)
+    }
 
-        let version = instance.get_version().unwrap_or(1);
-
-        // Circom 2 feature flag with version 2
-        #[cfg(feature = "circom-2")]
-        fn new_circom2(instance: Wasm, memory: Memory, version: u32) -> Result<WitnessCalculator> {
-            let n32 = instance.get_field_num_len32()?;
-            let mut safe_memory = SafeMemory::new(memory, n32 as usize, BigInt::zero());
-            instance.get_raw_prime()?;
-            let mut arr = vec![0; n32 as usize];
-            for i in 0..n32 {
-                let res = instance.read_shared_rw_memory(i)?;
-                arr[(n32 as usize) - (i as usize) - 1] = res;
-            }
-            let prime = from_array32(arr);
-
-            let n64 = ((prime.bits() - 1) / 64 + 1) as u32;
-            safe_memory.prime = prime;
-
-            Ok(WitnessCalculator {
-                instance,
-                memory: safe_memory,
-                n64,
-                circom_version: version,
-            })
+    pub fn new_from_wasm(store: &mut Store, instance: Wasm) -> Result<Self> {
+        let n32 = instance.get_field_num_len32(store)?;
+        instance.get_raw_prime(store)?;
+        let mut arr = vec![0; n32 as usize];
+        for i in 0..n32 {
+            let res = instance.read_shared_rw_memory(store, i)?;
+            arr[(n32 as usize) - (i as usize) - 1] = res;
         }
+        let prime = from_array32(arr);
 
-        fn new_circom1(instance: Wasm, memory: Memory, version: u32) -> Result<WitnessCalculator> {
-            // Fallback to Circom 1 behavior
-            let n32 = (instance.get_fr_len()? >> 2) - 2;
-            let mut safe_memory = SafeMemory::new(memory, n32 as usize, BigInt::zero());
-            let ptr = instance.get_ptr_raw_prime()?;
-            let prime = safe_memory.read_big(ptr as usize, n32 as usize)?;
+        let n64 = ((prime.bits() - 1) / 64 + 1) as u32;
 
-            let n64 = ((prime.bits() - 1) / 64 + 1) as u32;
-            safe_memory.prime = prime;
-
-            Ok(WitnessCalculator {
-                instance,
-                memory: safe_memory,
-                n64,
-                circom_version: version,
-            })
-        }
-
-        // Three possibilities:
-        // a) Circom 2 feature flag enabled, WASM runtime version 2
-        // b) Circom 2 feature flag enabled, WASM runtime version 1
-        // c) Circom 1 default behavior
-        //
-        // Once Circom 2 support is more stable, feature flag can be removed
-
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "circom-2")] {
-                match version {
-                    2 => new_circom2(instance, memory, version),
-                    1 => new_circom1(instance, memory, version),
-                    _ => panic!("Unknown Circom version")
-                }
-            } else {
-                new_circom1(instance, memory, version)
-            }
-        }
+        Ok(WitnessCalculator {
+            instance,
+            memory: None,
+            n64,
+            prime,
+        })
     }
 
     pub fn calculate_witness<I: IntoIterator<Item = (String, Vec<BigInt>)>>(
         &mut self,
+        store: &mut Store,
         inputs: I,
         sanity_check: bool,
     ) -> Result<Vec<BigInt>> {
-        self.instance.init(sanity_check)?;
+        self.instance.init(store, sanity_check)?;
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "circom-2")] {
-                match self.circom_version {
-                    2 => self.calculate_witness_circom2(inputs, sanity_check),
-                    1 => self.calculate_witness_circom1(inputs, sanity_check),
-                    _ => panic!("Unknown Circom version")
-                }
-            } else {
-                self.calculate_witness_circom1(inputs, sanity_check)
-            }
-        }
-    }
-
-    // Circom 1 default behavior
-    fn calculate_witness_circom1<I: IntoIterator<Item = (String, Vec<BigInt>)>>(
-        &mut self,
-        inputs: I,
-        sanity_check: bool,
-    ) -> Result<Vec<BigInt>> {
-        self.instance.init(sanity_check)?;
-
-        let old_mem_free_pos = self.memory.free_pos();
-        let p_sig_offset = self.memory.alloc_u32();
-        let p_fr = self.memory.alloc_fr();
-
-        // allocate the inputs
-        for (name, values) in inputs.into_iter() {
-            let (msb, lsb) = fnv(&name);
-
-            self.instance
-                .get_signal_offset32(p_sig_offset, 0, msb, lsb)?;
-
-            let sig_offset = self.memory.read_u32(p_sig_offset as usize) as usize;
-
-            for (i, value) in values.into_iter().enumerate() {
-                self.memory.write_fr(p_fr as usize, &value)?;
-                self.instance
-                    .set_signal(0, 0, (sig_offset + i) as u32, p_fr)?;
-            }
-        }
-
-        let mut w = Vec::new();
-
-        let n_vars = self.instance.get_n_vars()?;
-        for i in 0..n_vars {
-            let ptr = self.instance.get_ptr_witness(i)? as usize;
-            let el = self.memory.read_fr(ptr)?;
-            w.push(el);
-        }
-
-        self.memory.set_free_pos(old_mem_free_pos);
-
-        Ok(w)
-    }
-
-    // Circom 2 feature flag with version 2
-    #[cfg(feature = "circom-2")]
-    fn calculate_witness_circom2<I: IntoIterator<Item = (String, Vec<BigInt>)>>(
-        &mut self,
-        inputs: I,
-        sanity_check: bool,
-    ) -> Result<Vec<BigInt>> {
-        self.instance.init(sanity_check)?;
-
-        let n32 = self.instance.get_field_num_len32()?;
+        let n32 = self.instance.get_field_num_len32(store)?;
 
         // allocate the inputs
         for (name, values) in inputs.into_iter() {
@@ -238,21 +130,25 @@ impl WitnessCalculator {
             for (i, value) in values.into_iter().enumerate() {
                 let f_arr = to_array32(&value, n32 as usize);
                 for j in 0..n32 {
-                    self.instance
-                        .write_shared_rw_memory(j, f_arr[(n32 as usize) - 1 - (j as usize)])?;
+                    self.instance.write_shared_rw_memory(
+                        store,
+                        j,
+                        f_arr[(n32 as usize) - 1 - (j as usize)],
+                    )?;
                 }
-                self.instance.set_input_signal(msb, lsb, i as u32)?;
+                self.instance.set_input_signal(store, msb, lsb, i as u32)?;
             }
         }
 
         let mut w = Vec::new();
 
-        let witness_size = self.instance.get_witness_size()?;
+        let witness_size = self.instance.get_witness_size(store)?;
         for i in 0..witness_size {
-            self.instance.get_witness(i)?;
+            self.instance.get_witness(store, i)?;
             let mut arr = vec![0; n32 as usize];
             for j in 0..n32 {
-                arr[(n32 as usize) - 1 - (j as usize)] = self.instance.read_shared_rw_memory(j)?;
+                arr[(n32 as usize) - 1 - (j as usize)] =
+                    self.instance.read_shared_rw_memory(store, j)?;
             }
             w.push(from_array32(arr));
         }
@@ -261,16 +157,16 @@ impl WitnessCalculator {
     }
 
     pub fn calculate_witness_element<
-        E: ark_ec::pairing::Pairing,
+        F: PrimeField,
         I: IntoIterator<Item = (String, Vec<BigInt>)>,
     >(
         &mut self,
+        store: &mut Store,
         inputs: I,
         sanity_check: bool,
-    ) -> Result<Vec<E::ScalarField>> {
-        use ark_ff::PrimeField;
-        let witness = self.calculate_witness(inputs, sanity_check)?;
-        let modulus = <E::ScalarField as PrimeField>::MODULUS;
+    ) -> Result<Vec<F>> {
+        let modulus = F::MODULUS;
+        let witness = self.calculate_witness(store, inputs, sanity_check)?;
 
         // convert it to field elements
         use num_traits::Signed;
@@ -283,25 +179,11 @@ impl WitnessCalculator {
                 } else {
                     w.to_biguint().unwrap()
                 };
-                E::ScalarField::from(w)
+                F::from(w)
             })
             .collect::<Vec<_>>();
 
         Ok(witness)
-    }
-
-    pub fn get_witness_buffer(&self) -> Result<Vec<u8>> {
-        let ptr = self.instance.get_ptr_witness_buffer()? as usize;
-
-        let view = self.memory.memory.view::<u8>();
-
-        let len = self.instance.get_n_vars()? * self.n64 * 8;
-        let arr = view[ptr..ptr + len as usize]
-            .iter()
-            .map(Cell::get)
-            .collect::<Vec<_>>();
-
-        Ok(arr)
     }
 }
 
@@ -309,7 +191,7 @@ impl WitnessCalculator {
 mod runtime {
     use super::*;
 
-    pub fn error(store: &Store) -> Function {
+    pub fn error(store: &mut Store) -> Function {
         #[allow(unused)]
         #[allow(clippy::many_single_char_names)]
         fn func(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> Result<(), RuntimeError> {
@@ -318,47 +200,47 @@ mod runtime {
             println!("runtime error, exiting early: {a} {b} {c} {d} {e} {f}",);
             Err(RuntimeError::user(Box::new(ExitCode(1))))
         }
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 
     // Circom 2.0
-    pub fn exception_handler(store: &Store) -> Function {
+    pub fn exception_handler(store: &mut Store) -> Function {
         #[allow(unused)]
         fn func(a: i32) {}
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 
     // Circom 2.0
-    pub fn show_memory(store: &Store) -> Function {
+    pub fn show_memory(store: &mut Store) -> Function {
         #[allow(unused)]
         fn func() {}
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 
     // Circom 2.0
-    pub fn print_error_message(store: &Store) -> Function {
+    pub fn print_error_message(store: &mut Store) -> Function {
         #[allow(unused)]
         fn func() {}
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 
     // Circom 2.0
-    pub fn write_buffer_message(store: &Store) -> Function {
+    pub fn write_buffer_message(store: &mut Store) -> Function {
         #[allow(unused)]
         fn func() {}
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 
-    pub fn log_signal(store: &Store) -> Function {
+    pub fn log_signal(store: &mut Store) -> Function {
         #[allow(unused)]
         fn func(a: i32, b: i32) {}
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 
-    pub fn log_component(store: &Store) -> Function {
+    pub fn log_component(store: &mut Store) -> Function {
         #[allow(unused)]
         fn func(a: i32) {}
-        Function::new_native(store, func)
+        Function::new_typed(store, func)
     }
 }
 
@@ -370,7 +252,6 @@ mod tests {
     struct TestCase<'a> {
         circuit_path: &'a str,
         inputs_path: &'a str,
-        n_vars: u32,
         n64: u32,
         witness: &'a [&'a str],
     }
@@ -381,23 +262,21 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
-    #[test]
-    fn multiplier_1() {
+    #[tokio::test]
+    async fn multiplier_1() {
         run_test(TestCase {
-            circuit_path: root_path("test-vectors/mycircuit.wasm").as_str(),
+            circuit_path: root_path("test-vectors/mycircuit_js/mycircuit.wasm").as_str(),
             inputs_path: root_path("test-vectors/mycircuit-input1.json").as_str(),
-            n_vars: 4,
             n64: 4,
             witness: &["1", "33", "3", "11"],
         });
     }
 
-    #[test]
-    fn multiplier_2() {
+    #[tokio::test]
+    async fn multiplier_2() {
         run_test(TestCase {
-            circuit_path: root_path("test-vectors/mycircuit.wasm").as_str(),
+            circuit_path: root_path("test-vectors/mycircuit_js/mycircuit.wasm").as_str(),
             inputs_path: root_path("test-vectors/mycircuit-input2.json").as_str(),
-            n_vars: 4,
             n64: 4,
             witness: &[
                 "1",
@@ -408,12 +287,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn multiplier_3() {
+    #[tokio::test]
+    async fn multiplier_3() {
         run_test(TestCase {
-            circuit_path: root_path("test-vectors/mycircuit.wasm").as_str(),
+            circuit_path: root_path("test-vectors/mycircuit_js/mycircuit.wasm").as_str(),
             inputs_path: root_path("test-vectors/mycircuit-input3.json").as_str(),
-            n_vars: 4,
             n64: 4,
             witness: &[
                 "1",
@@ -424,32 +302,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn safe_multipler() {
+    #[tokio::test]
+    async fn safe_multipler() {
         let witness =
             std::fs::read_to_string(root_path("test-vectors/safe-circuit-witness.json")).unwrap();
         let witness: Vec<String> = serde_json::from_str(&witness).unwrap();
         let witness = &witness.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
         run_test(TestCase {
-            circuit_path: root_path("test-vectors/circuit2.wasm").as_str(),
+            circuit_path: root_path("test-vectors/circuit2_js/circuit2.wasm").as_str(),
             inputs_path: root_path("test-vectors/mycircuit-input1.json").as_str(),
-            n_vars: 132, // 128 + 4
-            n64: 4,
-            witness,
-        });
-    }
-
-    #[test]
-    fn smt_verifier() {
-        let witness =
-            std::fs::read_to_string(root_path("test-vectors/smtverifier10-witness.json")).unwrap();
-        let witness: Vec<String> = serde_json::from_str(&witness).unwrap();
-        let witness = &witness.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
-
-        run_test(TestCase {
-            circuit_path: root_path("test-vectors/smtverifier10.wasm").as_str(),
-            inputs_path: root_path("test-vectors/smtverifier10-input.json").as_str(),
-            n_vars: 4794,
             n64: 4,
             witness,
         });
@@ -467,12 +328,12 @@ mod tests {
     }
 
     fn run_test(case: TestCase) {
-        let mut wtns = WitnessCalculator::new(case.circuit_path).unwrap();
+        let mut store = Store::default();
+        let mut wtns = WitnessCalculator::new(&mut store, case.circuit_path).unwrap();
         assert_eq!(
-            wtns.memory.prime.to_str_radix(16),
+            wtns.prime.to_str_radix(16),
             "30644E72E131A029B85045B68181585D2833E84879B9709143E1F593F0000001".to_lowercase()
         );
-        assert_eq!({ wtns.instance.get_n_vars().unwrap() }, case.n_vars);
         assert_eq!({ wtns.n64 }, case.n64);
 
         let inputs_str = std::fs::read_to_string(case.inputs_path).unwrap();
@@ -497,7 +358,7 @@ mod tests {
             })
             .collect::<HashMap<_, _>>();
 
-        let res = wtns.calculate_witness(inputs, false).unwrap();
+        let res = wtns.calculate_witness(&mut store, inputs, false).unwrap();
         for (r, w) in res.iter().zip(case.witness) {
             assert_eq!(r, &BigInt::from_str(w).unwrap());
         }
